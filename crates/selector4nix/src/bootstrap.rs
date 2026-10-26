@@ -37,7 +37,8 @@ use selector4nix_core::domain::nar_info::{
 use selector4nix_core::domain::substituter::model::{Availability, Substituter, SubstituterMeta};
 use selector4nix_core::domain::substituter::{SubstituterRepository, SubstituterService};
 use selector4nix_core::infrastructure::config::{AppConfiguration, AppCredential};
-use selector4nix_core::infrastructure::metric::NarTransferMetric;
+use selector4nix_core::infrastructure::metric::{NarCacheMetric, NarTransferMetric};
+use selector4nix_core::infrastructure::nar_cache::NarDiskCache;
 use selector4nix_core::infrastructure::provider::*;
 use selector4nix_core::infrastructure::repository::*;
 use selector4nix_db::cache_kv::CacheKv;
@@ -251,6 +252,17 @@ pub async fn init_context(
         )
     });
 
+    let nar_cache_metric = Arc::new(NarCacheMetric::new());
+    let nar_disk_cache = Arc::new(NarDiskCache::new(
+        config.nar_disk_cache.clone(),
+        nar_stream_provider.clone(),
+        substituter_repository.clone(),
+        nar_file_repository.clone(),
+        nar_info_repository.clone(),
+        Arc::clone(&nar_cache_metric),
+    ));
+    nar_disk_cache.spawn_sweep_task();
+
     let nar_file_service = Arc::new(NarFileService::new(
         nar_stream_provider,
         substituter_repository.clone(),
@@ -347,6 +359,7 @@ pub async fn init_context(
         nar_file_registry.clone(),
         nar_info_repository.clone(),
         nar_transfer_metric.clone(),
+        Arc::clone(&nar_disk_cache),
     );
 
     let get_dashboard_overview_usecase = GetDashboardOverviewUseCase::new(

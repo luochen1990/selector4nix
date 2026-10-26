@@ -16,6 +16,7 @@ use crate::domain::nar_file::port::NarStreamData;
 use crate::domain::nar_info::NarInfoRepository;
 use crate::domain::nar_info::model::StorePathHash;
 use crate::infrastructure::metric::{NarTransferHandle, NarTransferMeta, NarTransferMetric};
+use crate::infrastructure::nar_cache::{NarDiskCache, OpenUpstream};
 use crate::{AppError, AppResultExt};
 
 pub struct StreamNarFileUseCase {
@@ -23,6 +24,7 @@ pub struct StreamNarFileUseCase {
     nar_file_registry: Arc<NarFileActorRegistry>,
     nar_info_repository: Arc<dyn NarInfoRepository>,
     nar_transfer_metric: Arc<NarTransferMetric>,
+    nar_disk_cache: Arc<NarDiskCache>,
 }
 
 impl StreamNarFileUseCase {
@@ -31,12 +33,14 @@ impl StreamNarFileUseCase {
         nar_file_registry: Arc<NarFileActorRegistry>,
         nar_info_repository: Arc<dyn NarInfoRepository>,
         nar_transfer_metric: Arc<NarTransferMetric>,
+        nar_disk_cache: Arc<NarDiskCache>,
     ) -> Self {
         Self {
             substituter_registry,
             nar_file_registry,
             nar_info_repository,
             nar_transfer_metric,
+            nar_disk_cache,
         }
     }
 
@@ -47,6 +51,12 @@ impl StreamNarFileUseCase {
         headers: PassthroughHeaders,
     ) -> Result<NarStreamData, AppError> {
         tracing::info!(nar_file = %key.to_file_name().value(), "acquiring nar stream from substituter");
+
+        // With the disk cache disabled the flow below is byte-for-byte the original
+        // streaming path (spec §3 "disabled" branch).
+        if self.nar_disk_cache.is_enabled() {
+            return self.run_with_cache(key, upstream_query, headers).await;
+        }
 
         let address = self.nar_file_registry.get(&key).await;
 
@@ -59,7 +69,7 @@ impl StreamNarFileUseCase {
             .await
             .throw_catastrophic("`NarFileActor` terminated unexpectedly")?;
 
-        self.exec_events(response.events).await;
+        Self::exec_events(&self.substituter_registry, response.events).await;
 
         let result = response
             .result
@@ -79,6 +89,69 @@ impl StreamNarFileUseCase {
         ))
     }
 
+    /// Cache-enabled route (spec §3): the facade decides between bypass / miss / partial
+    /// hit / complete and hands back whichever stream it produced.
+    async fn run_with_cache(
+        &self,
+        key: NarFileKey,
+        upstream_query: Option<QueryParameters>,
+        headers: PassthroughHeaders,
+    ) -> Result<NarStreamData, AppError> {
+        let open_upstream =
+            self.open_upstream(key.clone(), upstream_query.clone(), headers.clone());
+        let served = self
+            .nar_disk_cache
+            .serve(key.clone(), upstream_query, headers, open_upstream)
+            .await?;
+
+        // Transfer metrics for cache-served NARs report the synthetic cache URL (or the
+        // real upstream URL on bypass/miss) as both source and substituter label — the
+        // concrete substituter is internal to the facade.
+        Ok(instrument_stream(
+            &self.nar_transfer_metric,
+            NarTransferMeta {
+                nar_file_name: key.to_file_name(),
+                store_path: self.query_store_path(served.store_path_hash.as_ref()).await,
+                substituter_url: served.data.source_url.clone(),
+                source_url: served.data.source_url.clone(),
+                content_length: served.data.headers.content_length,
+            },
+            served.data,
+        ))
+    }
+
+    /// The repeatable real-time opener consumed by the cache facade: one actor round per
+    /// call, exactly like the uncached path (query, headers and events included).
+    fn open_upstream(
+        &self,
+        key: NarFileKey,
+        upstream_query: Option<QueryParameters>,
+        headers: PassthroughHeaders,
+    ) -> OpenUpstream {
+        let nar_file_registry = Arc::clone(&self.nar_file_registry);
+        let substituter_registry = Arc::clone(&self.substituter_registry);
+        Arc::new(move || {
+            let nar_file_registry = Arc::clone(&nar_file_registry);
+            let substituter_registry = Arc::clone(&substituter_registry);
+            let key = key.clone();
+            let upstream_query = upstream_query.clone();
+            let headers = headers.clone();
+            Box::pin(async move {
+                let address = nar_file_registry.get(&key).await;
+                let response = address
+                    .ask(|reply_to| NarFileRequest::StreamNarFile {
+                        reply_to,
+                        upstream_query,
+                        headers,
+                    })
+                    .await
+                    .throw_catastrophic("`NarFileActor` terminated unexpectedly")?;
+                Self::exec_events(&substituter_registry, response.events).await;
+                response.result.map(|result| result.stream)
+            })
+        })
+    }
+
     async fn query_store_path(&self, hash: Option<&StorePathHash>) -> Option<String> {
         let nar_info = self.nar_info_repository.get(hash?).await.ok().flatten()?;
         nar_info
@@ -86,24 +159,27 @@ impl StreamNarFileUseCase {
             .and_then(|data| data.store_path().map(ToString::to_string))
     }
 
-    async fn exec_events(&self, events: Vec<StreamNarFileEvent>) {
+    async fn exec_events(
+        registry: &Arc<SubstituterActorRegistry>,
+        events: Vec<StreamNarFileEvent>,
+    ) {
         for event in events {
-            self.exec_event(event).await;
+            Self::exec_event(registry, event).await;
         }
     }
 
-    async fn exec_event(&self, event: StreamNarFileEvent) {
+    async fn exec_event(registry: &Arc<SubstituterActorRegistry>, event: StreamNarFileEvent) {
         match event {
             StreamNarFileEvent::SubstituterSucceeded(url) => {
-                let sender = self.substituter_registry.get(&url).await;
+                let sender = registry.get(&url).await;
                 let _ = sender.tell(SubstituterRequest::ServiceSuccessful).await;
             }
             StreamNarFileEvent::SubstituterOffline(url) => {
-                let sender = self.substituter_registry.get(&url).await;
+                let sender = registry.get(&url).await;
                 let _ = sender.tell(SubstituterRequest::ServiceOffline).await;
             }
             StreamNarFileEvent::SubstituterError(url) => {
-                let sender = self.substituter_registry.get(&url).await;
+                let sender = registry.get(&url).await;
                 let _ = sender.tell(SubstituterRequest::ServiceError).await;
             }
         }
