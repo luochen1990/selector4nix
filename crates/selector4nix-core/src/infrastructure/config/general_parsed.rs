@@ -10,8 +10,9 @@ use crate::domain::nar_info::ResolutionPolicyOption;
 use crate::domain::nar_info::model::NarUrlRewriteOption;
 use crate::domain::substituter::model::{PeriodicProbingOption, Priority};
 use crate::infrastructure::config::general_raw::{
-    AppRawConfiguration, CacheInfoRawConfiguration, CacheRawConfiguration, NetworkRawConfiguration,
-    ProxyRawConfiguration, ServerRawConfiguration, SubstituterRawConfiguration,
+    AppRawConfiguration, CacheInfoRawConfiguration, CacheRawConfiguration,
+    NarDiskCacheRawConfiguration, NetworkRawConfiguration, ProxyRawConfiguration,
+    ServerRawConfiguration, SubstituterRawConfiguration,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -21,6 +22,7 @@ pub struct AppConfiguration {
     pub proxy: ProxyConfiguration,
     pub cache_info: CacheInfoConfiguration,
     pub cache: CacheConfiguration,
+    pub nar_disk_cache: NarDiskCacheConfiguration,
     pub substituters: Vec<SubstituterConfiguration>,
 }
 
@@ -73,6 +75,7 @@ impl TryFrom<AppRawConfiguration> for AppConfiguration {
             proxy: raw.proxy.unwrap_or_default().try_into()?,
             cache_info: raw.cache_info.unwrap_or_default().try_into()?,
             cache: raw.cache.unwrap_or_default().try_into()?,
+            nar_disk_cache: raw.nar_disk_cache.unwrap_or_default().try_into()?,
             substituters: raw
                 .substituters
                 .into_iter()
@@ -242,6 +245,37 @@ impl TryFrom<CacheRawConfiguration> for CacheConfiguration {
             nar_file_ttl: raw
                 .nar_file_ttl_secs
                 .map_or(Duration::from_hours(4), |s| Duration::from_secs(s.get())),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NarDiskCacheConfiguration {
+    pub enabled: bool,
+    pub dir: PathBuf,
+    pub max_size_bytes: u64,
+    pub partial_retention_secs: u64,
+    pub fsync_interval_bytes: u64,
+}
+
+impl TryFrom<NarDiskCacheRawConfiguration> for NarDiskCacheConfiguration {
+    type Error = AnyhowError;
+
+    fn try_from(raw: NarDiskCacheRawConfiguration) -> Result<Self, Self::Error> {
+        let dir: PathBuf = raw
+            .dir
+            .map_or_else(|| PathBuf::from("/var/cache/selector4nix"), PathBuf::from);
+        if !dir.is_absolute() {
+            return Err(anyhow::anyhow!(
+                "config `nar_disk_cache.dir` should be an absolute path"
+            ));
+        }
+        Ok(Self {
+            enabled: raw.enabled.unwrap_or(false),
+            dir,
+            max_size_bytes: raw.max_size_bytes.unwrap_or(20 * 1024 * 1024 * 1024),
+            partial_retention_secs: raw.partial_retention_secs.unwrap_or(172800),
+            fsync_interval_bytes: raw.fsync_interval_bytes.unwrap_or(64 * 1024 * 1024),
         })
     }
 }

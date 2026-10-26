@@ -443,8 +443,10 @@ fn make_offset_stream(
 
     let chunk0_len = chunk_max_len.min(data.len() - start_offset);
     let initial_fail_at = schedule.stream_fail_at(0, chunk0_len);
-    let initial_chunk_stream: SBoxStream<AnyhowResult<Bytes>> =
-        Box::pin(MockStream::new(data.slice(start_offset..start_offset + chunk0_len), initial_fail_at));
+    let initial_chunk_stream: SBoxStream<AnyhowResult<Bytes>> = Box::pin(MockStream::new(
+        data.slice(start_offset..start_offset + chunk0_len),
+        initial_fail_at,
+    ));
 
     let args = ChunkedStreamArgs {
         start_offset,

@@ -68,4 +68,21 @@ impl NarStreamProvider for MockNarStreamProvider {
         }
         (Ok(None), attempts)
     }
+
+    async fn stream_nar_from_offset(
+        &self,
+        locations: &[NarFileLocation],
+        offset: u64,
+        headers: &PassthroughHeaders,
+    ) -> (
+        AnyhowResult<Option<NarStreamData>>,
+        Vec<NarStreamOpenAttempt>,
+    ) {
+        // This mock is not range-aware; only offset-zero requests make sense for it.
+        assert_eq!(
+            offset, 0,
+            "`MockNarStreamProvider` cannot serve ranged requests"
+        );
+        self.stream_nar(locations, headers).await
+    }
 }

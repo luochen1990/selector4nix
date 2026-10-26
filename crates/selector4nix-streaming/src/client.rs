@@ -311,10 +311,7 @@ mod tests {
 
     #[test]
     fn parse_content_range_accepts_odd_whitespace() {
-        assert_eq!(
-            parse_content_range("bytes  12-30/64 "),
-            Some((12, 64)),
-        );
+        assert_eq!(parse_content_range("bytes  12-30/64 "), Some((12, 64)),);
     }
 
     #[test]

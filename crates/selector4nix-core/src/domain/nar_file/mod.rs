@@ -5,4 +5,4 @@ mod repository;
 mod service;
 
 pub use repository::NarFileRepository;
-pub use service::{NarFileService, StreamNarFileEvent};
+pub use service::{NarFileService, StreamNarFileEvent, build_nar_file_locations};

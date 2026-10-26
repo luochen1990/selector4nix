@@ -70,6 +70,20 @@ nar_file_cache_capacity = 4096
 # Time-to-live in seconds for cached NAR file location entries (default: 14400, minimum: 1).
 nar_file_ttl_secs = 14400
 
+# Disk cache for in-flight NAR downloads: retain partial files on interruption and resume
+# them from the persisted watermark on the next request (default: disabled).
+[nar_disk_cache]
+# Whether to enable the NAR disk cache (default: false).
+enabled = false
+# Base directory for partial files, created on startup (default: "/var/cache/selector4nix").
+dir = "/var/cache/selector4nix"
+# Upper bound for the total size of partial files (default: 21474836480, i.e. 20 GiB).
+max_size_bytes = 21474836480
+# Time-to-live in seconds for partial files (default: 172800, i.e. 48 hours).
+partial_retention_secs = 172800
+# How often appended bytes are fsync-ed and the watermark persisted (default: 67108864, i.e. 64 MiB).
+fsync_interval_bytes = 67108864
+
 # Upstream substituter list (at least one required).
 [[substituters]]
 # Base URL of the upstream substituter.

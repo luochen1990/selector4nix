@@ -167,7 +167,8 @@ impl ChunkedStream {
     }
 
     fn chunk_range(&self, index: usize) -> ChunkRange {
-        let offset = self.start_offset + (self.window_offset + index) * usize::from(self.chunk_max_len);
+        let offset =
+            self.start_offset + (self.window_offset + index) * usize::from(self.chunk_max_len);
         let len = (self.bytes_total - offset).min(usize::from(self.chunk_max_len));
         ChunkRange { offset, len }
     }

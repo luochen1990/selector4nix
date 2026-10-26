@@ -1,4 +1,5 @@
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use selector4nix_core::domain::nar_info::ResolutionPolicyOption;
@@ -123,6 +124,69 @@ fn empty_substituters_is_rejected() {
 ip = "127.0.0.1"
 "#,
     );
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn nar_disk_cache_defaults_are_applied_when_section_omitted() {
+    let config = AppConfiguration::deserialize(&make_config_string_minimal()).unwrap();
+
+    assert!(!config.nar_disk_cache.enabled);
+    assert_eq!(
+        config.nar_disk_cache.dir,
+        PathBuf::from("/var/cache/selector4nix"),
+    );
+    assert_eq!(config.nar_disk_cache.max_size_bytes, 21474836480);
+    assert_eq!(config.nar_disk_cache.partial_retention_secs, 172800);
+    assert_eq!(config.nar_disk_cache.fsync_interval_bytes, 67108864);
+}
+
+#[test]
+fn nar_disk_cache_overrides_are_applied() {
+    let config = AppConfiguration::deserialize(&make_config_string_overriden(
+        r#"
+[nar_disk_cache]
+enabled = true
+dir = "/tmp/s4x-nar-cache"
+max_size_bytes = 1073741824
+partial_retention_secs = 3600
+fsync_interval_bytes = 1048576
+"#,
+    ))
+    .unwrap();
+
+    assert!(config.nar_disk_cache.enabled);
+    assert_eq!(
+        config.nar_disk_cache.dir,
+        PathBuf::from("/tmp/s4x-nar-cache"),
+    );
+    assert_eq!(config.nar_disk_cache.max_size_bytes, 1073741824);
+    assert_eq!(config.nar_disk_cache.partial_retention_secs, 3600);
+    assert_eq!(config.nar_disk_cache.fsync_interval_bytes, 1048576);
+}
+
+#[test]
+fn non_absolute_nar_disk_cache_dir_is_rejected() {
+    let result = AppConfiguration::deserialize(&make_config_string_overriden(
+        r#"
+[nar_disk_cache]
+enabled = true
+dir = "relative/dir"
+"#,
+    ));
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn nar_disk_cache_unknown_field_is_rejected() {
+    let result = AppConfiguration::deserialize(&make_config_string_overriden(
+        r#"
+[nar_disk_cache]
+unknown_field = true
+"#,
+    ));
 
     assert!(result.is_err());
 }

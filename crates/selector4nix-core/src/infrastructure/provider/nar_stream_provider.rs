@@ -48,19 +48,20 @@ impl ReqwestNarStreamProvider {
         let stream = response.into_stream();
         Ok(Some(NarStreamData::new(headers, stream, url)))
     }
-}
 
-#[async_trait]
-impl NarStreamProvider for ReqwestNarStreamProvider {
-    async fn stream_nar(
+    /// Race GET requests for `locations` in parallel and take the first usable response.
+    /// `start_offset` requests a stream resuming at that byte offset (0 = plain request);
+    /// responses that do not honor a nonzero offset are reported as `RangeUnsupported`.
+    async fn stream_with_offset(
         &self,
         locations: &[NarFileLocation],
+        start_offset: u64,
         headers: &PassthroughHeaders,
     ) -> (
         AnyhowResult<Option<NarStreamData>>,
         Vec<NarStreamOpenAttempt>,
     ) {
-        tracing::debug!(urls = ?locations.iter().map(|l| l.source_url()).collect::<Vec<_>>(), "opening nar file streams from substituters");
+        tracing::debug!(urls = ?locations.iter().map(|l| l.source_url()).collect::<Vec<_>>(), ?start_offset, "opening nar file streams from substituters");
 
         if locations.is_empty() {
             return (Ok(None), Vec::new());
@@ -75,19 +76,24 @@ impl NarStreamProvider for ReqwestNarStreamProvider {
             let credentials = Arc::clone(&self.credentials);
 
             set.spawn(async move {
-                let request = client.get(location.source_url().value()).configure({
-                    let location = location.clone();
-                    move |request| {
-                        let mut request = request.headers(headers.to_headers());
+                let request = client
+                    .get(location.source_url().value())
+                    .start_offset(start_offset)
+                    .configure({
+                        let location = location.clone();
+                        move |request| {
+                            let mut request = request.headers(headers.to_headers());
 
-                        if let Some(credential) = credentials.lookup(location.source_url()) {
-                            request = request
-                                .basic_auth(credential.login.clone(), credential.secret.clone());
+                            if let Some(credential) = credentials.lookup(location.source_url()) {
+                                request = request.basic_auth(
+                                    credential.login.clone(),
+                                    credential.secret.clone(),
+                                );
+                            }
+
+                            request
                         }
-
-                        request
-                    }
-                });
+                    });
 
                 let response = if let Some(timeout) = location.timeout() {
                     tokio::time::timeout(timeout, request.send()).await
@@ -109,6 +115,13 @@ impl NarStreamProvider for ReqwestNarStreamProvider {
 
             match response {
                 Ok(Ok(response)) => {
+                    if start_offset > 0 && response.starts_at() != start_offset {
+                        tracing::debug!(%url, ?start_offset, actual_start = %response.starts_at(), "substituter ignored the range request");
+                        attempts.push(NarStreamOpenAttempt::RangeUnsupported {
+                            source_url: url.clone(),
+                        });
+                        continue;
+                    }
                     attempts.push(NarStreamOpenAttempt::Successful {
                         source_url: url.clone(),
                     });
@@ -144,5 +157,31 @@ impl NarStreamProvider for ReqwestNarStreamProvider {
             let err = Err(anyhow::anyhow!("could not fetch nar from any substituter"));
             (err, attempts)
         }
+    }
+}
+
+#[async_trait]
+impl NarStreamProvider for ReqwestNarStreamProvider {
+    async fn stream_nar(
+        &self,
+        locations: &[NarFileLocation],
+        headers: &PassthroughHeaders,
+    ) -> (
+        AnyhowResult<Option<NarStreamData>>,
+        Vec<NarStreamOpenAttempt>,
+    ) {
+        self.stream_with_offset(locations, 0, headers).await
+    }
+
+    async fn stream_nar_from_offset(
+        &self,
+        locations: &[NarFileLocation],
+        offset: u64,
+        headers: &PassthroughHeaders,
+    ) -> (
+        AnyhowResult<Option<NarStreamData>>,
+        Vec<NarStreamOpenAttempt>,
+    ) {
+        self.stream_with_offset(locations, offset, headers).await
     }
 }

@@ -196,6 +196,58 @@ Maximum number of cached NAR file location entries. This has no effect on the ca
 
 Time-to-live in seconds for cached NAR file location entries.
 
+## `nar_disk_cache`
+
+Optional disk cache for in-flight NAR downloads. When enabled, bytes streamed from upstream
+substituters are concurrently appended to a partial file on disk (keyed by the NAR file name,
+which is content-addressed). If a download breaks midway, the next client request resumes from
+the persisted watermark via a `Range: bytes=<watermark>-` upstream request instead of
+re-downloading the whole file — NAR files are typically large and the Nix client itself has no
+cross-request resume. Partial files whose hash does not match the narinfo `FileHash` after
+completion are deleted and re-fetched once from another substituter; verified complete files
+are served from disk exactly once and then removed. The feature never serves unverified disk
+bytes to clients and never starts a download without a waiting consumer.
+
+### `nar_disk_cache.enabled`
+
+- Type: Boolean
+- Default: `false`
+
+Whether to enable the NAR disk cache. When disabled (the default), request handling is exactly
+the same as previous behavior.
+
+### `nar_disk_cache.dir`
+
+- Type: Path
+- Default: `"/var/cache/selector4nix"` (must be absolute)
+
+Base directory holding the `partial/` subdirectory. It is created on startup if missing; if it
+cannot be created or written, the whole feature is bypassed with a single `WARN` log and the
+server keeps running as if the cache was disabled.
+
+### `nar_disk_cache.max_size_bytes`
+
+- Type: Integer
+- Default: `21474836480` (20 GiB)
+
+Upper bound for the total size of partial files. A background sweep deletes the least recently
+updated partials when the bound is exceeded.
+
+### `nar_disk_cache.partial_retention_secs`
+
+- Type: Integer
+- Default: `172800` (48 hours)
+
+Time-to-live in seconds for partial files, counted from their last progress (watermark update).
+
+### `nar_disk_cache.fsync_interval_bytes`
+
+- Type: Integer
+- Default: `67108864` (64 MiB)
+
+How often appended bytes are `fsync`-ed and the watermark metadata persisted. On an unclean
+shutdown, up to this many already-received bytes may need re-downloading.
+
 ## `substituters`
 
 Upstream substituter list. At least one entry is required.

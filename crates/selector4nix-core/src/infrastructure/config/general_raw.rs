@@ -12,6 +12,7 @@ pub struct AppRawConfiguration {
     pub proxy: Option<ProxyRawConfiguration>,
     pub cache_info: Option<CacheInfoRawConfiguration>,
     pub cache: Option<CacheRawConfiguration>,
+    pub nar_disk_cache: Option<NarDiskCacheRawConfiguration>,
     pub substituters: Vec<SubstituterRawConfiguration>,
 }
 
@@ -66,6 +67,16 @@ pub struct CacheRawConfiguration {
     pub nar_info_ttl_secs: Option<NonZeroU64>,
     pub nar_file_cache_capacity: Option<NonZeroUsize>,
     pub nar_file_ttl_secs: Option<NonZeroU64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct NarDiskCacheRawConfiguration {
+    pub enabled: Option<bool>,
+    pub dir: Option<String>,
+    pub max_size_bytes: Option<u64>,
+    pub partial_retention_secs: Option<u64>,
+    pub fsync_interval_bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize)]
