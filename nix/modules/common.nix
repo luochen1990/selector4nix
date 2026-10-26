@@ -9,6 +9,17 @@
 
 let
   settingsFormat = pkgs.formats.toml { };
+
+  # TOML has no null: recursively drop null-valued keys (attrs and lists) so unset
+  # options fall back to the Rust-side defaults (missing key == serde `Option::None`).
+  stripNulls =
+    value:
+    if lib.isAttrs value then
+      lib.filterAttrs (_: v: v != null) (lib.mapAttrs (_: stripNulls) value)
+    else if lib.isList value then
+      map stripNulls value
+    else
+      value;
 in
 {
   serviceOptions = {
@@ -56,6 +67,43 @@ in
             description = "The port that selector4nix listens on";
             default = 5496;
             example = 5496;
+          };
+        };
+
+        options.nar_disk_cache = {
+          enabled = lib.mkOption {
+            type = lib.types.bool;
+            description = "Whether to cache NAR downloads on disk and resume interrupted ones from the watermark";
+            default = false;
+            example = true;
+          };
+
+          dir = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            description = "Absolute path of the cache directory (defaults to a subdirectory of the cache root when null)";
+            default = null;
+            example = "/var/cache/selector4nix/nar";
+          };
+
+          max_size_bytes = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.unsigned;
+            description = "Total size budget of cached partial NAR files";
+            default = null;
+            example = 10737418240;
+          };
+
+          partial_retention_secs = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.unsigned;
+            description = "How long an unfinished partial NAR survives without progress before eviction";
+            default = null;
+            example = 86400;
+          };
+
+          fsync_interval_bytes = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.unsigned;
+            description = "Checkpoint (fsync + meta update) interval in appended bytes";
+            default = null;
+            example = 16777216;
           };
         };
       };
@@ -110,7 +158,7 @@ in
   mkConfigFile =
     cfg:
     let
-      rawConfigFile = settingsFormat.generate "selector4nix.raw.toml" cfg.settings;
+      rawConfigFile = settingsFormat.generate "selector4nix.raw.toml" (stripNulls cfg.settings);
     in
     pkgs.runCommand "selector4nix.toml" { } ''
       echo 'Checking the configuration file `selector4nix.toml` via `selector4nix check`'
