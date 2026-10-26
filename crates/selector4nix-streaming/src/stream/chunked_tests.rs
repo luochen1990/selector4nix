@@ -183,6 +183,7 @@ fn make_stream(
         Box::pin(MockStream::new(data.slice(0..chunk0_len), initial_fail_at));
 
     let args = ChunkedStreamArgs {
+        start_offset: 0,
         chunk_max_len: NonZeroUsize::new(chunk_max_len).unwrap(),
         bytes_total: data.len(),
         window_max_len: NonZeroUsize::new(window_max_len).unwrap(),
@@ -389,6 +390,7 @@ async fn last_permit_retained_while_other_streams_wait() {
     tokio::task::yield_now().await;
 
     let args = ChunkedStreamArgs {
+        start_offset: 0,
         chunk_max_len: NonZeroUsize::new(CHUNK_LEN).unwrap(),
         bytes_total: data.len(),
         window_max_len: NonZeroUsize::new(8).unwrap(),
@@ -408,4 +410,89 @@ async fn last_permit_retained_while_other_streams_wait() {
     assert_eq!(out.len(), DATA_LEN);
     assert_eq!(out, data.to_vec());
     contender.abort();
+}
+
+// Builds a chunked stream resumed at `start_offset`, mirroring how `StreamingClient` wires a
+// ranged response into `ChunkedStreamArgs`. Chunk indices are relative to the resume point.
+fn make_offset_stream(
+    data_len: usize,
+    start_offset: usize,
+    chunk_max_len: usize,
+    window_max_len: usize,
+    max_concurrent_requests: usize,
+    schedule: FailSchedule,
+    retry_attempts: usize,
+) -> (ChunkedStream, Bytes) {
+    let data = make_bytes(data_len);
+
+    let connector = Box::new(MockConnector {
+        data: data.clone(),
+        chunk_max_len,
+        schedule: schedule.clone(),
+    });
+
+    let throttler = Box::new(ThrottlerAdapter::new(
+        Arc::new(PerHostHttpThrottler::new(ThrottlingOptions::new(
+            NonZeroUsize::new(max_concurrent_requests).unwrap(),
+        ))),
+        "example.com".to_string(),
+    ));
+    let initial_permit = throttler
+        .try_acquire()
+        .expect("a permit must be available at startup");
+
+    let chunk0_len = chunk_max_len.min(data.len() - start_offset);
+    let initial_fail_at = schedule.stream_fail_at(0, chunk0_len);
+    let initial_chunk_stream: SBoxStream<AnyhowResult<Bytes>> =
+        Box::pin(MockStream::new(data.slice(start_offset..start_offset + chunk0_len), initial_fail_at));
+
+    let args = ChunkedStreamArgs {
+        start_offset,
+        chunk_max_len: NonZeroUsize::new(chunk_max_len).unwrap(),
+        bytes_total: data.len(),
+        window_max_len: NonZeroUsize::new(window_max_len).unwrap(),
+        max_retries: retry_attempts,
+        connector,
+        throttler,
+        initial_permit,
+        initial_chunk_stream,
+    };
+
+    (ChunkedStream::new(args), data)
+}
+
+#[tokio::test]
+async fn offset_stream_reassembles_tail() {
+    let (mut stream, data) = make_offset_stream(1000, 350, 100, 4, 8, FailSchedule::default(), 3);
+
+    let out = collect_ok(&mut stream).await;
+    assert_eq!(out, data.slice(350..).to_vec());
+}
+
+#[tokio::test]
+async fn offset_stream_unaligned_start_with_small_chunks() {
+    let (mut stream, data) = make_offset_stream(997, 3, 50, 2, 8, FailSchedule::default(), 3);
+
+    let out = collect_ok(&mut stream).await;
+    assert_eq!(out, data.slice(3..).to_vec());
+}
+
+#[tokio::test]
+async fn offset_stream_chunk_error_retries_then_succeeds() {
+    // Chunk indices are relative to the resume point, so this failure targets the second
+    // chunk after the offset.
+    let (mut stream, data) =
+        make_offset_stream(1000, 350, 100, 4, 8, FailSchedule::connect_fail(2, 1), 3);
+
+    let out = collect_ok(&mut stream).await;
+    assert_eq!(out, data.slice(350..).to_vec());
+}
+
+#[tokio::test]
+async fn offset_at_total_yields_empty_stream() {
+    let (mut stream, data) = make_offset_stream(100, 100, 50, 4, 8, FailSchedule::default(), 3);
+
+    let out = collect_ok(&mut stream).await;
+    assert!(out.is_empty());
+    assert_eq!(data.len(), 100);
 }

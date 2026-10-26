@@ -71,6 +71,7 @@ impl StreamingClient {
             host,
             context: Arc::clone(&self.context),
             configure: None,
+            start_offset: 0,
         }
     }
 }
@@ -80,6 +81,7 @@ pub struct StreamingRequest {
     host: String,
     configure: Option<Box<dyn Fn(RequestBuilder) -> RequestBuilder + Send + Sync + 'static>>,
     context: Arc<StreamingClientContext>,
+    start_offset: u64,
 }
 
 impl StreamingRequest {
@@ -95,6 +97,16 @@ impl StreamingRequest {
         self
     }
 
+    /// Request the object starting at the given byte offset instead of byte 0. When chunked
+    /// streaming is enabled the leading chunk of the resumed span is requested first (so
+    /// chunk-level resume keeps working from that offset); otherwise a plain
+    /// `Range: bytes=<offset>-` request is issued. Servers that ignore the range and answer
+    /// with a full 200 body are detected via `StreamingResponse::starts_at`.
+    pub fn start_offset(mut self, offset: u64) -> Self {
+        self.start_offset = offset;
+        self
+    }
+
     pub async fn send(self) -> Result<StreamingResponse, StreamHttpBodyError> {
         let permit = self.context.throttler.acquire(&self.host).await;
 
@@ -104,10 +116,16 @@ impl StreamingRequest {
             // The first request always asks for the leading chunk so that servers supporting range
             // requests can be served via a chunked response, while servers that ignore `Range` fall
             // back to a full stream.
+            let start = self.start_offset;
             request.header(
                 header::RANGE,
-                format!("bytes=0-{}", usize::from(self.context.chunk_max_len) - 1),
+                format!(
+                    "bytes={start}-{}",
+                    start as usize + usize::from(self.context.chunk_max_len) - 1
+                ),
             )
+        } else if self.start_offset > 0 {
+            request.header(header::RANGE, format!("bytes={}-", self.start_offset))
         } else {
             request
         };
@@ -127,6 +145,7 @@ enum StreamingResponseInner {
     },
     Chunked {
         response: Response,
+        start_offset: usize,
         bytes_total: usize,
         initial_chunk_len: usize,
         url: Url,
@@ -135,6 +154,17 @@ enum StreamingResponseInner {
         context: Arc<StreamingClientContext>,
         permit: ThrottlerPermit,
     },
+}
+
+/// Parse a `Content-Range` header value shaped like `bytes <start>-<end>/<total>` into its
+/// `(start, total)` pair.
+fn parse_content_range(value: &str) -> Option<(usize, usize)> {
+    let (range, total) = value.trim().rsplit_once('/')?;
+    let total = total.trim().parse::<usize>().ok()?;
+    let range = range.trim().strip_prefix("bytes")?.trim();
+    let (start, _) = range.split_once('-')?;
+    let start = start.trim().parse::<usize>().ok()?;
+    Some((start, total))
 }
 
 impl StreamingResponse {
@@ -155,12 +185,11 @@ impl StreamingResponse {
                 }))
             }
             StatusCode::PARTIAL_CONTENT | StatusCode::OK => {
-                let bytes_total = response
+                let (start_offset, bytes_total) = response
                     .headers()
                     .get(header::CONTENT_RANGE)
                     .and_then(|h| h.to_str().ok())
-                    .and_then(|h| h.rsplit_once('/'))
-                    .and_then(|(_, total)| total.parse::<usize>().ok())
+                    .and_then(parse_content_range)
                     .context(InvalidResponseSnafu {
                         message:
                             "206 Partial Content response is missing a valid Content-Range header",
@@ -173,9 +202,10 @@ impl StreamingResponse {
                 )?;
 
                 let url = response.url().clone();
-                tracing::debug!(%url, ?bytes_total, ?initial_chunk_len, "select chunked stream");
+                tracing::debug!(%url, ?start_offset, ?bytes_total, ?initial_chunk_len, "select chunked stream");
                 Ok(StreamingResponse(StreamingResponseInner::Chunked {
                     response,
+                    start_offset,
                     bytes_total,
                     initial_chunk_len,
                     url,
@@ -194,6 +224,17 @@ impl StreamingResponse {
         match &self.0 {
             StreamingResponseInner::Full { content_length, .. } => *content_length,
             StreamingResponseInner::Chunked { bytes_total, .. } => Some(*bytes_total as u64),
+        }
+    }
+
+    /// Absolute byte offset the response body starts at: the parsed `Content-Range` start for
+    /// partial responses, or `0` when the server sent the whole object (200 without
+    /// `Content-Range`). Callers that requested a nonzero offset use this to detect servers
+    /// that silently ignored the `Range` header.
+    pub fn starts_at(&self) -> u64 {
+        match &self.0 {
+            StreamingResponseInner::Full { .. } => 0,
+            StreamingResponseInner::Chunked { start_offset, .. } => *start_offset as u64,
         }
     }
 
@@ -216,6 +257,7 @@ impl StreamingResponse {
             )),
             StreamingResponseInner::Chunked {
                 response,
+                start_offset,
                 bytes_total,
                 initial_chunk_len,
                 url,
@@ -224,6 +266,7 @@ impl StreamingResponse {
                 context,
                 permit,
             } => Box::pin(ChunkedStream::new(ChunkedStreamArgs {
+                start_offset,
                 chunk_max_len: context.chunk_max_len,
                 bytes_total,
                 window_max_len: context.window_max_len,
@@ -254,4 +297,31 @@ pub enum StreamHttpBodyError {
     InvalidStatus { status: StatusCode },
     #[snafu(display("invalid response from the server: {message}"))]
     InvalidResponse { message: &'static str },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_content_range;
+
+    #[test]
+    fn parse_content_range_extracts_start_and_total() {
+        assert_eq!(parse_content_range("bytes 350-449/1000"), Some((350, 1000)));
+        assert_eq!(parse_content_range("bytes 0-49/50"), Some((0, 50)));
+    }
+
+    #[test]
+    fn parse_content_range_accepts_odd_whitespace() {
+        assert_eq!(
+            parse_content_range("bytes  12-30/64 "),
+            Some((12, 64)),
+        );
+    }
+
+    #[test]
+    fn parse_content_range_rejects_malformed_values() {
+        assert_eq!(parse_content_range("bytes */1000"), None);
+        assert_eq!(parse_content_range("bytes 12-30"), None);
+        assert_eq!(parse_content_range("items 1-2/3"), None);
+        assert_eq!(parse_content_range(""), None);
+    }
 }

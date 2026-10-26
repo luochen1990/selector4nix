@@ -27,7 +27,12 @@ pub trait ChunkTrottler: Send + Sync + Unpin {
 }
 
 pub struct ChunkedStreamArgs {
+    /// Absolute byte offset where this stream starts. A stream resumed at a nonzero offset
+    /// covers `[start_offset, bytes_total)` and chunk indices are relative to it, so
+    /// chunk-level resume machinery works unchanged for partial downloads.
+    pub start_offset: usize,
     pub chunk_max_len: NonZeroUsize,
+    /// Full size of the remote object (not the remaining span from `start_offset`).
     pub bytes_total: usize,
     pub window_max_len: NonZeroUsize,
     pub max_retries: usize,
@@ -38,6 +43,7 @@ pub struct ChunkedStreamArgs {
 }
 
 pub struct ChunkedStream {
+    start_offset: usize,
     chunk_max_len: NonZeroUsize,
     bytes_total: usize,
     bytes_consumed: usize,
@@ -53,12 +59,14 @@ pub struct ChunkedStream {
 
 impl ChunkedStream {
     pub fn new(args: ChunkedStreamArgs) -> Self {
+        let has_span = args.bytes_total > args.start_offset;
         Self {
+            start_offset: args.start_offset,
             chunk_max_len: args.chunk_max_len,
             bytes_total: args.bytes_total,
             bytes_consumed: 0,
             bytes_received: 0,
-            window: if args.bytes_total > 0 {
+            window: if has_span {
                 vec![Chunk::Transferring {
                     buffer: VecDeque::new(),
                     stream: args.initial_chunk_stream,
@@ -74,12 +82,17 @@ impl ChunkedStream {
             max_retries: args.max_retries,
             connector: args.connector,
             throttler: args.throttler,
-            permits: if args.bytes_total > 0 {
+            permits: if has_span {
                 vec![args.initial_permit]
             } else {
                 Vec::new()
             },
         }
+    }
+
+    /// Remaining bytes covered by this stream: `[start_offset, bytes_total)`.
+    fn span(&self) -> usize {
+        self.bytes_total.saturating_sub(self.start_offset)
     }
 
     fn poll_next_impl(
@@ -96,7 +109,7 @@ impl ChunkedStream {
         }
 
         // Try to acquire throttler permits to start transferring more chunks.
-        let chunks_total = this.bytes_total.div_ceil(usize::from(this.chunk_max_len));
+        let chunks_total = this.span().div_ceil(usize::from(this.chunk_max_len));
         let chunks_not_finished = this.window.iter().filter(|c| !c.is_finished()).count();
         let mut acquired_free_permits = this.permits.len().saturating_sub(chunks_not_finished);
         while this.window_offset + this.window.len() < chunks_total
@@ -154,7 +167,7 @@ impl ChunkedStream {
     }
 
     fn chunk_range(&self, index: usize) -> ChunkRange {
-        let offset = (self.window_offset + index) * usize::from(self.chunk_max_len);
+        let offset = self.start_offset + (self.window_offset + index) * usize::from(self.chunk_max_len);
         let len = (self.bytes_total - offset).min(usize::from(self.chunk_max_len));
         ChunkRange { offset, len }
     }
@@ -321,7 +334,7 @@ impl ChunkedStream {
                     // one that acquired currently. This prevents stalling the entire stream where
                     // all permits are returned but no permit can be acquired afterwards due to
                     // contention.
-                    if self.permits.len() > 1 || self.bytes_received >= self.bytes_total {
+                    if self.permits.len() > 1 || self.bytes_received >= self.span() {
                         tracing::trace!(?offset, permits = ?self.permits.len(), bytes_received = ?self.bytes_received, "release chunk permit");
                         self.permits.pop();
                     } else {
