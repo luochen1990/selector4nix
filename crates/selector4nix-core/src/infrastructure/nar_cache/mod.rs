@@ -41,7 +41,7 @@ use crate::domain::nar_file::NarFileRepository;
 use crate::domain::nar_file::model::NarFileKey;
 use crate::domain::nar_file::port::{NarStreamData, NarStreamHeaders, NarStreamProvider};
 use crate::domain::nar_info::NarInfoRepository;
-use crate::domain::nar_info::model::StorePathHash;
+use crate::domain::nar_info::model::{NarFileName, StorePathHash};
 use crate::domain::substituter::SubstituterRepository;
 use crate::infrastructure::config::NarDiskCacheConfiguration;
 use crate::infrastructure::metric::NarCacheMetric;
@@ -192,8 +192,13 @@ impl NarDiskCache {
             let mut interval = tokio::time::interval(SWEEP_INTERVAL);
             loop {
                 interval.tick().await;
-                let active = supervisor.active_names();
-                let report = storage.sweep(&active, retention_secs, max_size_bytes);
+                // The activeness predicate is evaluated live inside the sweep, so names
+                // becoming in-flight between collection and deletion are still spared.
+                let report = storage.sweep(
+                    &|name| supervisor.is_active(name),
+                    retention_secs,
+                    max_size_bytes,
+                );
                 if report.deleted > 0 {
                     tracing::info!(
                         deleted = report.deleted,
@@ -224,9 +229,12 @@ impl NarDiskCache {
         let name = key.to_file_name();
         let name_value = name.value().to_string();
 
-        let nar_file = inner.nar_file_repository.get(&key).await.ok().flatten();
-        let store_path_hash = nar_file
-            .as_ref()
+        let store_path_hash = inner
+            .nar_file_repository
+            .get(&key)
+            .await
+            .ok()
+            .flatten()
             .and_then(|file| file.store_path_hash().cloned());
         let expectation = match store_path_hash.as_ref() {
             Some(hash) => inner.lookup_expectation(hash).await,
@@ -247,65 +255,46 @@ impl NarDiskCache {
         for _ in 0..MAX_SERVE_ROUNDS {
             match inner.storage.inspect(&name_value, expectation.file_size) {
                 PartialState::Absent | PartialState::Partial { watermark: 0 } => {
-                    let data = inner
+                    match inner
                         .serve_miss(&name_value, &expectation, &open_upstream)
-                        .await?;
-                    return Ok(ServedNar {
-                        data,
-                        store_path_hash,
-                    });
+                        .await?
+                    {
+                        Some(data) => {
+                            return Ok(ServedNar {
+                                data,
+                                store_path_hash,
+                            });
+                        }
+                        // Progress appeared on disk while we were opening upstream; loop
+                        // to re-inspect and route to the fill path instead.
+                        None => continue,
+                    }
                 }
                 PartialState::Partial { watermark } => {
                     tracing::info!(nar_file = %name_value, from = watermark, total = expectation.file_size, "nar cache resumed");
                     inner.metric.record_partial_hit(watermark);
-                    let plan = FillPlan {
-                        nar_file_name: name.clone(),
-                        file_hash: expectation.file_hash.clone(),
-                        file_size: expectation.file_size,
-                        start_offset: watermark,
-                        upstream_query: upstream_query.clone(),
-                        headers: headers.clone(),
-                    };
+                    let plan = fill_plan(&name, &expectation, watermark, &upstream_query, &headers);
                     match inner
-                        .supervisor
-                        .join_fill(&plan, Arc::clone(&inner.deps))
-                        .await
+                        .join_fill_and_serve(&name_value, plan, RESUME_MESSAGES, false)
+                        .await?
                     {
-                        FillResult::Ready { file, total } => {
-                            let serve_file = file.try_clone().map_err(|err| {
-                                AppError::chain_infrastructure(
-                                    err,
-                                    "failed to open serving handle for cached nar",
-                                )
-                            })?;
+                        FillServeOutcome::Served(data) => {
                             return Ok(ServedNar {
-                                data: disk_serve_data(&name_value, serve_file, total),
+                                data,
                                 store_path_hash,
                             });
                         }
-                        // The append episode ended (a teeing client disconnected, or a
-                        // cancelled filler); re-inspect and take over from the new state.
-                        FillResult::Ended => continue,
-                        FillResult::FallbackNeeded => {
+                        FillServeOutcome::Retry => continue,
+                        FillServeOutcome::Fallback => {
                             let data = open_upstream().await?;
                             return Ok(ServedNar {
                                 data,
                                 store_path_hash,
                             });
                         }
-                        FillResult::NotFound => {
-                            return Err(AppError::not_found(
-                                "nar file not found in any substituter while filling cache",
-                            ));
-                        }
-                        FillResult::Failed(message) => {
-                            return Err(AppError::infrastructure(format!(
-                                "nar cache fill failed: {message}"
-                            )));
-                        }
                     }
                 }
-                PartialState::Complete { .. } => {
+                PartialState::Complete => {
                     match inner
                         .storage
                         .verify(&name_value, &expectation.file_hash, expectation.file_size)
@@ -330,51 +319,32 @@ impl NarDiskCache {
                             inner.storage.delete(&name_value);
                             // Self-heal: one full refetch preferring untried substituters
                             // (spec §5), modeled as a zero-offset fill.
-                            let plan = FillPlan {
-                                nar_file_name: name.clone(),
-                                file_hash: expectation.file_hash.clone(),
-                                file_size: expectation.file_size,
-                                start_offset: 0,
-                                upstream_query: upstream_query.clone(),
-                                headers: headers.clone(),
-                            };
+                            let plan = fill_plan(&name, &expectation, 0, &upstream_query, &headers);
                             match inner
-                                .supervisor
-                                .join_fill(&plan, Arc::clone(&inner.deps))
-                                .await
+                                .join_fill_and_serve(&name_value, plan, REFETCH_MESSAGES, true)
+                                .await?
                             {
-                                FillResult::Ready { file, total } => {
-                                    inner.metric.record_disk_hit();
-                                    let serve_file = file.try_clone().map_err(|err| {
-                                        AppError::chain_infrastructure(
-                                            err,
-                                            "failed to open serving handle for cached nar",
-                                        )
-                                    })?;
+                                FillServeOutcome::Served(data) => {
                                     return Ok(ServedNar {
-                                        data: disk_serve_data(&name_value, serve_file, total),
+                                        data,
                                         store_path_hash,
                                     });
                                 }
-                                FillResult::Ended => continue,
-                                FillResult::FallbackNeeded => {
+                                FillServeOutcome::Retry => continue,
+                                FillServeOutcome::Fallback => {
                                     let data = open_upstream().await?;
                                     return Ok(ServedNar {
                                         data,
                                         store_path_hash,
                                     });
                                 }
-                                FillResult::NotFound => {
-                                    return Err(AppError::not_found(
-                                        "nar file disappeared from substituters while refilling cache",
-                                    ));
-                                }
-                                FillResult::Failed(message) => {
-                                    return Err(AppError::infrastructure(format!(
-                                        "nar cache refetch failed: {message}"
-                                    )));
-                                }
                             }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            // The partial vanished between inspect and verify (a sweep
+                            // raced us); loop to re-inspect and restart as a miss.
+                            tracing::info!(nar_file = %name_value, "nar cache partial vanished before verification");
+                            continue;
                         }
                         Err(err) => {
                             return Err(AppError::chain_infrastructure(
@@ -392,7 +362,87 @@ impl NarDiskCache {
     }
 }
 
+/// Outcome of one fill round from the caller's perspective.
+enum FillServeOutcome {
+    /// A verified stream ready to hand to the client.
+    Served(NarStreamData),
+    /// The append episode ended (a teeing client disconnected, or a cancelled filler);
+    /// re-inspect the disk and take over from the new state.
+    Retry,
+    /// No substituter honors range requests; serve a real-time stream instead.
+    Fallback,
+}
+
+/// Error texts distinguishing a watermark resume from a full refetch.
+struct FillMessages {
+    not_found: &'static str,
+    failed_prefix: &'static str,
+}
+
+const RESUME_MESSAGES: FillMessages = FillMessages {
+    not_found: "nar file not found in any substituter while filling cache",
+    failed_prefix: "nar cache fill failed: ",
+};
+
+const REFETCH_MESSAGES: FillMessages = FillMessages {
+    not_found: "nar file disappeared from substituters while refilling cache",
+    failed_prefix: "nar cache refetch failed: ",
+};
+
+fn fill_plan(
+    name: &NarFileName,
+    expectation: &NarExpectation,
+    start_offset: u64,
+    upstream_query: &Option<QueryParameters>,
+    headers: &PassthroughHeaders,
+) -> FillPlan {
+    FillPlan {
+        nar_file_name: name.clone(),
+        file_hash: expectation.file_hash.clone(),
+        file_size: expectation.file_size,
+        start_offset,
+        upstream_query: upstream_query.clone(),
+        headers: headers.clone(),
+    }
+}
+
 impl NarDiskCacheInner {
+    async fn join_fill_and_serve(
+        &self,
+        name: &str,
+        plan: FillPlan,
+        messages: FillMessages,
+        record_disk_hit_on_ready: bool,
+    ) -> Result<FillServeOutcome, AppError> {
+        match self
+            .supervisor
+            .join_fill(&plan, Arc::clone(&self.deps))
+            .await
+        {
+            FillResult::Ready { file, total } => {
+                if record_disk_hit_on_ready {
+                    self.metric.record_disk_hit();
+                }
+                let serve_file = file.try_clone().map_err(|err| {
+                    AppError::chain_infrastructure(
+                        err,
+                        "failed to open serving handle for cached nar",
+                    )
+                })?;
+                Ok(FillServeOutcome::Served(disk_serve_data(
+                    name, serve_file, total,
+                )))
+            }
+            FillResult::Ended => Ok(FillServeOutcome::Retry),
+            FillResult::FallbackNeeded => Ok(FillServeOutcome::Fallback),
+            FillResult::NotFound => Err(AppError::not_found(messages.not_found)),
+            FillResult::Failed(message) => Err(AppError::infrastructure(format!(
+                "{}{message}",
+                messages.failed_prefix
+            ))),
+        }
+    }
+
     async fn lookup_expectation(&self, hash: &StorePathHash) -> Option<NarExpectation> {
         let nar_info = self.nar_info_repository.get(hash).await.ok()??;
         let content = nar_info.nar_info()?.content();
@@ -400,36 +450,48 @@ impl NarDiskCacheInner {
     }
 
     /// Miss route: stream real-time upstream, teed to disk when this request holds the
-    /// append license (spec §3 miss branch, spec §4 concurrent-miss rule).
+    /// append license (spec §3 miss branch, spec §4 concurrent-miss rule). Returns `None`
+    /// when progress appeared on disk while the upstream was being opened — the caller
+    /// must re-route to the fill path instead of truncating the persisted bytes (§0.4).
     async fn serve_miss(
         &self,
         name: &str,
         expectation: &NarExpectation,
         open_upstream: &OpenUpstream,
-    ) -> Result<NarStreamData, AppError> {
+    ) -> Result<Option<NarStreamData>, AppError> {
         let data = open_upstream().await?;
 
         // The append license is the single-writer guarantee; a concurrent miss streams
         // real-time without teeing (spec §4).
         if let Some(guard) = self.supervisor.acquire_tee(name) {
-            match self.storage.create_append(name, expectation.file_size) {
-                Ok(appender) => {
-                    let stream = NarTeeStream::new(data.inner, appender, guard, name.to_string());
-                    return Ok(NarStreamData::new(
-                        data.headers,
-                        Box::pin(stream),
-                        data.source_url,
-                    ));
+            match self.storage.inspect(name, expectation.file_size) {
+                PartialState::Absent | PartialState::Partial { watermark: 0 } => {
+                    match self.storage.create_append(name, expectation.file_size) {
+                        Ok(appender) => {
+                            let stream =
+                                NarTeeStream::new(data.inner, appender, guard, name.to_string());
+                            return Ok(Some(NarStreamData::new(
+                                data.headers,
+                                Box::pin(stream),
+                                data.source_url,
+                            )));
+                        }
+                        Err(err) => {
+                            tracing::warn!(nar_file = %name, %err, "nar cache bypass: could not open partial file for appending");
+                            // `guard` drops here, releasing the slot.
+                        }
+                    }
                 }
-                Err(err) => {
-                    tracing::warn!(nar_file = %name, %err, "nar cache bypass: could not open partial file for appending");
-                    // `guard` drops here, releasing the slot.
+                _ => {
+                    // A previous episode persisted progress during our upstream open;
+                    // dropping `guard` releases the slot and the caller re-routes.
+                    tracing::debug!(nar_file = %name, "nar cache miss raced with a finished appender, re-routing");
                 }
             }
         } else {
             tracing::debug!(nar_file = %name, "nar cache concurrent miss: streaming without disk append");
         }
-        Ok(data)
+        Ok(Some(data))
     }
 }
 
@@ -544,10 +606,15 @@ const DISK_READ_CHUNK_BYTES: usize = 256 * 1024;
 type DiskReadTask = JoinHandle<std::io::Result<(std::fs::File, Vec<u8>)>>;
 
 /// Streams `total` bytes of an open (possibly already unlinked) file through blocking
-/// reads on the tokio blocking pool. The fd is private to this stream, so independent
-/// waiters read their own copy independently (spec §4).
+/// positional reads on the tokio blocking pool.
+///
+/// Reads use pread semantics (`read_at` at a private offset), never the shared fd file
+/// cursor: several waiters of one verified file hold `dup`ed descriptors that share a
+/// single cursor, and cursor-style reads would interleave their output (spec §4). The fd
+/// is private to this stream otherwise.
 struct DiskNarStream {
     file: Option<std::fs::File>,
+    offset: u64,
     remaining: u64,
     pending: Option<DiskReadTask>,
 }
@@ -556,6 +623,7 @@ impl DiskNarStream {
     fn new(file: std::fs::File, total: u64) -> Self {
         Self {
             file: Some(file),
+            offset: 0,
             remaining: total,
             pending: None,
         }
@@ -577,10 +645,12 @@ impl Stream for DiskNarStream {
                 .take()
                 .expect("`file` must be present while no read is pending");
             let len = (this.remaining as usize).min(DISK_READ_CHUNK_BYTES);
+            let offset = this.offset;
             this.pending = Some(tokio::task::spawn_blocking(move || {
-                let mut file = file;
+                use std::os::unix::fs::FileExt;
+                let file = file;
                 let mut buffer = vec![0u8; len];
-                let read = std::io::Read::read(&mut file, &mut buffer)?;
+                let read = file.read_at(&mut buffer, offset)?;
                 buffer.truncate(read);
                 Ok((file, buffer))
             }));
@@ -594,6 +664,7 @@ impl Stream for DiskNarStream {
                         "cached nar partial ended prematurely"
                     ))));
                 }
+                this.offset += buffer.len() as u64;
                 this.remaining -= buffer.len() as u64;
                 this.file = Some(file);
                 Poll::Ready(Some(Ok(Bytes::from(buffer))))

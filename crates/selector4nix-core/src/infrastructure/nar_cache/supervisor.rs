@@ -12,7 +12,7 @@
 //! - Waiters of a tee are notified when it ends (client disconnect / EOF) so they can
 //!   re-inspect the disk and take over the append as a filler if needed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::File;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -107,9 +107,10 @@ impl AppendSupervisor {
         }
     }
 
-    /// Names with an active (in-flight) append episode; the sweep skips these.
-    pub fn active_names(&self) -> HashSet<String> {
-        self.entries.lock().unwrap().keys().cloned().collect()
+    /// Whether `name` currently has an in-flight append episode. Consulted fresh (not from
+    /// a snapshot) by the sweep right before deleting an entry.
+    pub fn is_active(&self, name: &str) -> bool {
+        self.entries.lock().unwrap().contains_key(name)
     }
 
     /// Acquire the exclusive right to append to `name` for a client-driven tee stream.
@@ -153,17 +154,13 @@ impl AppendSupervisor {
 
         let _waiter = WaiterGuard::new(Arc::clone(&entry));
         let mut outcome_rx = entry.outcome_tx.subscribe();
-        if let Some(result) = outcome_rx.borrow().clone() {
-            return result;
-        }
-        let result = outcome_rx
-            .wait_for(|outcome| outcome.is_some())
-            .await
-            .ok()
-            .and_then(|outcome| outcome.clone());
-        match result {
-            Some(result) => result,
-            None => FillResult::Failed("fill outcome channel closed".to_string()),
+        // `subscribe()` snapshots the current value, so `wait_for` returns immediately for
+        // an already-published outcome; late joiners never miss a finished fill.
+        match outcome_rx.wait_for(|outcome| outcome.is_some()).await {
+            Ok(outcome) => outcome
+                .clone()
+                .expect("the predicate guarantees a filled outcome"),
+            Err(_) => FillResult::Failed("fill outcome channel closed".to_string()),
         }
     }
 
@@ -220,25 +217,19 @@ impl Drop for WaiterGuard {
 /// verification fails (spec §5). The outcome is broadcast to all waiters.
 async fn run_fill(entry: Arc<AppendEntry>, plan: FillPlan, deps: Arc<FillDeps>) {
     let result = match fill_once(&plan, &deps, &entry.token, plan.start_offset, None).await {
-        FillStep::Ready { file, total } => FillResult::Ready { file, total },
         FillStep::VerifyFailed(bad_source) => {
             tracing::warn!(nar_file = %plan.name(), source = %bad_source, "nar cache refetching from scratch after verification failure");
             let exclude = Some(bad_source);
-            match fill_once(&plan, &deps, &entry.token, 0, exclude.as_ref()).await {
-                FillStep::Ready { file, total } => FillResult::Ready { file, total },
+            let refetch = fill_once(&plan, &deps, &entry.token, 0, exclude.as_ref()).await;
+            match refetch {
+                // A second verification failure is final: give up (spec §5, one refetch).
                 FillStep::VerifyFailed(_) => FillResult::Failed(
                     "nar cache refetch failed verification again, giving up".to_string(),
                 ),
-                FillStep::Cancelled => FillResult::Ended,
-                FillStep::NotFound => FillResult::NotFound,
-                FillStep::FallbackNeeded => FillResult::FallbackNeeded,
-                FillStep::Failed(message) => FillResult::Failed(message),
+                step => step.into_result(),
             }
         }
-        FillStep::Cancelled => FillResult::Ended,
-        FillStep::NotFound => FillResult::NotFound,
-        FillStep::FallbackNeeded => FillResult::FallbackNeeded,
-        FillStep::Failed(message) => FillResult::Failed(message),
+        step => step.into_result(),
     };
     // Publish first so late joiners still get the result, then free the slot.
     entry.outcome_tx.send_replace(Some(result));
@@ -253,6 +244,24 @@ enum FillStep {
     NotFound,
     FallbackNeeded,
     Failed(String),
+}
+
+impl FillStep {
+    /// Mechanical mapping to the broadcast result. `VerifyFailed` has no stand-alone
+    /// result: `run_fill` always intercepts it to attempt the refetch; the fallback here
+    /// exists only to keep the mapping total.
+    fn into_result(self) -> FillResult {
+        match self {
+            Self::Ready { file, total } => FillResult::Ready { file, total },
+            Self::VerifyFailed(_) => {
+                FillResult::Failed("nar cache verification failed".to_string())
+            }
+            Self::Cancelled => FillResult::Ended,
+            Self::NotFound => FillResult::NotFound,
+            Self::FallbackNeeded => FillResult::FallbackNeeded,
+            Self::Failed(message) => FillResult::Failed(message),
+        }
+    }
 }
 
 async fn fill_once(
@@ -298,9 +307,12 @@ async fn fill_once(
     {
         Ok(appender) => appender,
         Err(err) => {
-            return FillStep::Failed(format!(
-                "failed to open the partial file for appending: {err}"
-            ));
+            // Stale disk state (partial vanished or shrank, e.g. after a sweep raced us):
+            // end the episode instead of failing the client; waiters re-inspect and degrade
+            // to a fresh miss. Real I/O failures also land here and are bounded by the
+            // caller's serve-round limit.
+            tracing::info!(nar_file = %name, %err, "nar cache cannot append, ending fill episode");
+            return FillStep::Cancelled;
         }
     };
 
@@ -362,6 +374,12 @@ async fn fill_once(
             deps.storage.delete(name);
             FillStep::VerifyFailed(source_url)
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // The partial vanished between completion and verification (a sweep raced us);
+            // end the episode so waiters re-inspect and restart cleanly.
+            tracing::info!(nar_file = %name, "nar cache partial vanished before verification");
+            FillStep::Cancelled
+        }
         Err(err) => FillStep::Failed(format!("failed to verify the completed partial: {err}")),
     }
 }
@@ -380,16 +398,13 @@ async fn build_fill_candidates(
     match exclude {
         Some(excluded) => {
             let filtered: Vec<_> = candidates
-                .into_iter()
+                .iter()
                 .filter(|loc| loc.source_url() != excluded)
+                .cloned()
                 .collect();
             // A single-substituter setup has nowhere else to go: retry the same one.
             if filtered.is_empty() {
-                build_nar_file_locations(
-                    &substituters,
-                    &plan.nar_file_name,
-                    plan.upstream_query.as_ref(),
-                )
+                candidates
             } else {
                 filtered
             }

@@ -5,12 +5,14 @@
 //! the on-disk layout under `<dir>/partial/` and on the recorded provider calls.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result as AnyhowResult;
 use async_trait::async_trait;
 use futures::StreamExt;
+use selector4nix_core::AppError;
 use selector4nix_core::domain::common::expire_at::ExpireAt;
 use selector4nix_core::domain::common::passthrough_headers::PassthroughHeaders;
 use selector4nix_core::domain::common::url::Url;
@@ -26,7 +28,7 @@ use selector4nix_core::domain::substituter::model::test_support::make_substitute
 use selector4nix_core::domain::substituter::model::{Availability, Substituter};
 use selector4nix_core::infrastructure::config::NarDiskCacheConfiguration;
 use selector4nix_core::infrastructure::metric::NarCacheMetric;
-use selector4nix_core::infrastructure::nar_cache::NarDiskCache;
+use selector4nix_core::infrastructure::nar_cache::{NarDiskCache, OpenUpstream, ServedNar};
 use selector4nix_core::infrastructure::repository::InMemorySubstituterRepository;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -231,8 +233,7 @@ impl TestEnv {
         let (prefix, tail) = self.content.split_at(prefix_len);
         let open = chunked_upstream(vec![prefix.to_vec(), tail.to_vec()], self.a_src.clone());
         let served = self
-            .cache
-            .serve(self.key.clone(), None, PassthroughHeaders::empty(), open)
+            .serve(open)
             .await
             .expect("miss should serve a real-time stream");
         let mut stream = served.data.inner;
@@ -242,8 +243,21 @@ impl TestEnv {
     }
 
     /// A do-nothing upstream (empty stream) for requests expected to be served elsewhere.
-    fn empty_upstream(&self) -> selector4nix_core::infrastructure::nar_cache::OpenUpstream {
+    fn empty_upstream(&self) -> OpenUpstream {
         chunked_upstream(vec![], self.a_src.clone())
+    }
+
+    /// `NarDiskCache::serve` with this env's fixed key and empty passthrough headers.
+    fn serve(
+        &self,
+        open_upstream: OpenUpstream,
+    ) -> impl Future<Output = Result<ServedNar, AppError>> + '_ {
+        self.cache.serve(
+            self.key.clone(),
+            None,
+            PassthroughHeaders::empty(),
+            open_upstream,
+        )
     }
 }
 
@@ -263,7 +277,7 @@ async fn read_all(data: NarStreamData) -> (Vec<u8>, Url) {
 
 #[tokio::test]
 async fn t1_miss_disconnect_retains_partial_with_watermark() {
-    let provider = ScriptedNarStreamProvider::new([]);
+    let provider = ScriptedNarStreamProvider::new();
     let env = TestEnv::build(provider).await;
 
     let watermark = env.make_partial_via_tee(1024).await;
@@ -282,7 +296,7 @@ async fn t1_miss_disconnect_retains_partial_with_watermark() {
 
 #[tokio::test]
 async fn t2_t3_partial_hit_resumes_from_watermark_and_serves_verified() {
-    let provider = ScriptedNarStreamProvider::new([]);
+    let provider = ScriptedNarStreamProvider::new();
     let env = TestEnv::build(provider).await;
     env.provider
         .set_script(env.a_src.clone(), ScriptedBody::Bytes(env.content.clone()));
@@ -293,13 +307,7 @@ async fn t2_t3_partial_hit_resumes_from_watermark_and_serves_verified() {
     // Second request: the facade must ask upstream for `Range: bytes=1024-` (T2) and,
     // after verification, serve the full bytes from disk and unlink the partial (T3).
     let served = env
-        .cache
-        .serve(
-            env.key.clone(),
-            None,
-            PassthroughHeaders::empty(),
-            env.empty_upstream(),
-        )
+        .serve(env.empty_upstream())
         .await
         .expect("partial hit should fill and serve");
 
@@ -334,7 +342,7 @@ async fn t2_t3_partial_hit_resumes_from_watermark_and_serves_verified() {
 
 #[tokio::test]
 async fn t4_verify_failure_refetches_from_other_substituter() {
-    let provider = ScriptedNarStreamProvider::new([]);
+    let provider = ScriptedNarStreamProvider::new();
     let env = TestEnv::build(provider).await;
 
     let mut bad = (*env.content).clone();
@@ -349,13 +357,7 @@ async fn t4_verify_failure_refetches_from_other_substituter() {
     assert_eq!(watermark, 1024);
 
     let served = env
-        .cache
-        .serve(
-            env.key.clone(),
-            None,
-            PassthroughHeaders::empty(),
-            env.empty_upstream(),
-        )
+        .serve(env.empty_upstream())
         .await
         .expect("refetch from the second substituter should succeed");
 
@@ -386,18 +388,13 @@ async fn t4_verify_failure_refetches_from_other_substituter() {
 
 #[tokio::test]
 async fn t5_concurrent_misses_single_tee_both_clients_served() {
-    let provider = ScriptedNarStreamProvider::new([]);
+    let provider = ScriptedNarStreamProvider::new();
     let env = TestEnv::build(provider).await;
 
     let open_a = chunked_upstream(vec![(*env.content).clone()], env.a_src.clone());
     let open_b = chunked_upstream(vec![(*env.content).clone()], env.a_src.clone());
 
-    let (served_a, served_b) = tokio::join!(
-        env.cache
-            .serve(env.key.clone(), None, PassthroughHeaders::empty(), open_a),
-        env.cache
-            .serve(env.key.clone(), None, PassthroughHeaders::empty(), open_b),
-    );
+    let (served_a, served_b) = tokio::join!(env.serve(open_a), env.serve(open_b));
     let served_a = served_a.expect("first client should be served");
     let served_b = served_b.expect("second client should be served");
 
@@ -419,7 +416,7 @@ async fn t5_concurrent_misses_single_tee_both_clients_served() {
 
 #[tokio::test]
 async fn t6_last_waiter_disconnect_cancels_filler() {
-    let provider = ScriptedNarStreamProvider::new([]);
+    let provider = ScriptedNarStreamProvider::new();
     let env = TestEnv::build(provider).await;
     env.provider
         .set_script(env.a_src.clone(), ScriptedBody::Hang);
@@ -429,12 +426,7 @@ async fn t6_last_waiter_disconnect_cancels_filler() {
 
     // Box::pin: dropping the box must actually destroy the serve future (and with it the
     // fill waiter); a stack `pin!` would only drop the borrow and never cancel the filler.
-    let mut serve_fut = Box::pin(env.cache.serve(
-        env.key.clone(),
-        None,
-        PassthroughHeaders::empty(),
-        env.empty_upstream(),
-    ));
+    let mut serve_fut = Box::pin(env.serve(env.empty_upstream()));
 
     let outcome = tokio::time::timeout(Duration::from_millis(200), serve_fut.as_mut()).await;
     assert!(
@@ -461,15 +453,45 @@ async fn t6_last_waiter_disconnect_cancels_filler() {
     env.provider
         .set_script(env.a_src.clone(), ScriptedBody::Bytes(env.content.clone()));
     let served = env
-        .cache
-        .serve(
-            env.key.clone(),
-            None,
-            PassthroughHeaders::empty(),
-            env.empty_upstream(),
-        )
+        .serve(env.empty_upstream())
         .await
         .expect("the slot was released, the next request should fill successfully");
     let (bytes, _) = read_all(served.data).await;
     assert_eq!(bytes, *env.content);
+}
+
+// ---------------------------------------------------------------------------
+// T7: two concurrent partial-hit waiters share one verified file without
+//     interleaving (dup'ed fds share a cursor; serving must be positional)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn t7_concurrent_partial_hit_waiters_each_receive_full_bytes() {
+    let provider = ScriptedNarStreamProvider::new();
+    let env = TestEnv::build(provider).await;
+    env.provider
+        .set_script(env.a_src.clone(), ScriptedBody::Bytes(env.content.clone()));
+
+    let watermark = env.make_partial_via_tee(1024).await;
+    assert_eq!(watermark, 1024);
+
+    // Both requests hit the same partial and join the same filler; the verified file is
+    // served to each through its own dup'ed descriptor of one fd.
+    let (served_a, served_b) = tokio::join!(
+        env.serve(env.empty_upstream()),
+        env.serve(env.empty_upstream()),
+    );
+    let served_a = served_a.expect("first waiter should be served");
+    let served_b = served_b.expect("second waiter should be served");
+
+    let (bytes_a, _) = read_all(served_a.data).await;
+    let (bytes_b, _) = read_all(served_b.data).await;
+    assert_eq!(
+        bytes_a, *env.content,
+        "waiter A must get the full ordered bytes"
+    );
+    assert_eq!(
+        bytes_b, *env.content,
+        "waiter B must get the full ordered bytes"
+    );
 }

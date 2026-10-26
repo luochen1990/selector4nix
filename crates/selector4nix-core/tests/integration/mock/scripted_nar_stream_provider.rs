@@ -42,12 +42,11 @@ pub struct ScriptedNarStreamProvider {
 }
 
 impl ScriptedNarStreamProvider {
-    pub fn new<S>(scripts: S) -> Arc<Self>
-    where
-        S: IntoIterator<Item = (Url, ScriptedBody)>,
-    {
+    /// An empty provider; scripts are bound afterwards via `set_script` (the exact source
+    /// URLs are only known once the test env has built the NAR identity).
+    pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            scripts: Mutex::new(scripts.into_iter().collect()),
+            scripts: Mutex::new(HashMap::new()),
             calls: Mutex::new(Vec::new()),
         })
     }

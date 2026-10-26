@@ -78,12 +78,13 @@ pub enum PartialState {
     /// A prefix of `[0, watermark)` is on disk with `0 < watermark < expected_total`.
     Partial { watermark: u64 },
     /// `watermark == expected_total` bytes are on disk, verified or not.
-    Complete { watermark: u64 },
+    Complete,
 }
 
 /// Append handle for one partial file. Exactly one appender exists per NAR at any time
 /// (single-flight, see `supervisor`); writes are buffered by the OS and checkpointed to disk
 /// every `fsync_interval_bytes` appended bytes.
+#[derive(Debug)]
 pub struct PartialAppender {
     data: File,
     meta: PartialMeta,
@@ -96,14 +97,23 @@ pub struct PartialAppender {
 
 impl PartialAppender {
     /// Append received bytes and advance the watermark, checkpointing periodically.
+    /// Bytes beyond `expected_total` are dropped: a lying upstream must not be able to
+    /// grow the partial unboundedly (sweep skips active names, so nothing else would stop
+    /// it mid-flight); the client stream is forwarded unchanged regardless.
     pub fn append(&mut self, bytes: &[u8]) -> std::io::Result<()> {
         if self.finished {
             return Ok(());
         }
+        let room =
+            (self.meta.expected_total - self.meta.watermark).min(bytes.len() as u64) as usize;
+        if room == 0 {
+            return Ok(());
+        }
+        let bytes = &bytes[..room];
         self.data.write_all(bytes)?;
-        self.meta.watermark += bytes.len() as u64;
+        self.meta.watermark += room as u64;
         self.meta.updated_at = unix_now();
-        self.bytes_since_checkpoint += bytes.len() as u64;
+        self.bytes_since_checkpoint += room as u64;
         if self.bytes_since_checkpoint >= self.fsync_interval_bytes {
             self.checkpoint()?;
         }
@@ -222,7 +232,7 @@ impl NarCacheStorage {
             return PartialState::Absent;
         }
         if watermark == expected_total {
-            PartialState::Complete { watermark }
+            PartialState::Complete
         } else {
             PartialState::Partial { watermark }
         }
@@ -237,14 +247,16 @@ impl NarCacheStorage {
         self.open_appender(name, expected_total, 0, true)
     }
 
-    /// Resume appending at `watermark`, truncating any torn tail beyond it first.
+    /// Resume appending at `watermark`, truncating any torn tail beyond it first. A zero
+    /// watermark is a fresh fill and (re)creates the data file — refetches arrive here
+    /// right after the mismatched partial was evicted.
     pub fn resume_append(
         &self,
         name: &str,
         expected_total: u64,
         watermark: u64,
     ) -> std::io::Result<PartialAppender> {
-        self.open_appender(name, expected_total, watermark, false)
+        self.open_appender(name, expected_total, watermark, watermark == 0)
     }
 
     fn open_appender(
@@ -264,10 +276,20 @@ impl NarCacheStorage {
                 .truncate(true)
                 .open(&data_path)?
         } else {
-            let data = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&data_path)?;
+            // Strict resume: the persisted prefix must actually exist. `create` is
+            // deliberately absent — a vanished/short data file must not be fabricated up
+            // to `watermark` with zero bytes (the verification would then fail and burn
+            // the single refetch budget, spec §5).
+            let data = OpenOptions::new().append(true).open(&data_path)?;
+            let data_len = data.metadata()?.len();
+            if data_len < watermark {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "nar cache partial holds {data_len} bytes, less than the watermark {watermark}"
+                    ),
+                ));
+            }
             // Drop any torn tail beyond the checkpointed watermark before appending.
             data.set_len(watermark)?;
             data
@@ -336,21 +358,23 @@ impl NarCacheStorage {
     }
 
     /// Execute one sweep pass: delete expired partials, then least-recently-updated ones
-    /// until the directory fits `max_size_bytes`. Entries named in `active` (in-flight
-    /// appends/fills) are never touched.
+    /// until the directory fits `max_size_bytes`. `is_active` is consulted **again at
+    /// deletion time** (not from a pre-collection snapshot): a NAR may have become
+    /// in-flight between collection and deletion, and deleting it would pull the floor
+    /// out from under a running appender (spec §6).
     pub fn sweep(
         &self,
-        active: &HashSet<String>,
+        is_active: &dyn Fn(&str) -> bool,
         retention_secs: u64,
         max_size_bytes: u64,
     ) -> SweepReport {
         let now = unix_now();
-        let candidates = self.collect_sweep_candidates(active);
+        let candidates = self.collect_sweep_candidates(is_active);
         let doomed = plan_sweep(candidates, now, retention_secs, max_size_bytes);
         let mut report = SweepReport::default();
         for name in doomed {
-            // Re-check activeness: the entry may have become active after collection.
-            if active.contains(&name) {
+            // Fresh activeness check: the entry may have become active after collection.
+            if is_active(&name) {
                 continue;
             }
             let reclaimed = self.entry_disk_size(&name);
@@ -364,7 +388,7 @@ impl NarCacheStorage {
     /// Pair `.json` meta files with their data files and describe every deletable entry.
     /// An entry is a data file name; orphans on either side are reported with size and an
     /// `updated_at` of 0 so the TTL pass removes them.
-    fn collect_sweep_candidates(&self, active: &HashSet<String>) -> Vec<SweepCandidate> {
+    fn collect_sweep_candidates(&self, is_active: &dyn Fn(&str) -> bool) -> Vec<SweepCandidate> {
         let entries = match std::fs::read_dir(&self.partial_dir) {
             Ok(entries) => entries,
             Err(_) => return Vec::new(),
@@ -385,7 +409,7 @@ impl NarCacheStorage {
             if is_meta {
                 continue;
             }
-            if active.contains(name) {
+            if is_active(name) {
                 continue;
             }
             let updated_at = self.read_meta(name).map_or(0, |meta| meta.updated_at);
@@ -498,10 +522,7 @@ mod tests {
         a = storage.resume_append("x.nar", 100, 30).unwrap();
         a.append(&[1u8; 70]).unwrap();
         a.finish(true);
-        assert_eq!(
-            storage.inspect("x.nar", 100),
-            PartialState::Complete { watermark: 100 },
-        );
+        assert_eq!(storage.inspect("x.nar", 100), PartialState::Complete);
 
         // Same on-disk content but a different expectation: discard.
         assert_eq!(storage.inspect("x.nar", 200), PartialState::Absent);
@@ -526,10 +547,7 @@ mod tests {
         let mut b = storage.resume_append("x.nar", 100, 30).unwrap();
         b.append(&[2u8; 70]).unwrap();
         b.finish(true);
-        assert_eq!(
-            storage.inspect("x.nar", 100),
-            PartialState::Complete { watermark: 100 },
-        );
+        assert_eq!(storage.inspect("x.nar", 100), PartialState::Complete);
         assert_eq!(
             std::fs::metadata(storage.data_path("x.nar")).unwrap().len(),
             100
@@ -611,7 +629,7 @@ mod tests {
         )
         .unwrap();
 
-        let report = storage.sweep(&HashSet::new(), 500, u64::MAX);
+        let report = storage.sweep(&|_: &str| false, 500, u64::MAX);
         assert_eq!(report.deleted, 3); // stale + orphan + lonely
         assert!(!storage.data_path("stale.nar").exists());
         assert!(!storage.data_path("orphan.nar").exists());
@@ -625,7 +643,7 @@ mod tests {
             .map(|n| storage.entry_disk_size(n))
             .sum();
         let budget = total - storage.entry_disk_size("mid.nar");
-        let report = storage.sweep(&HashSet::new(), 500, budget);
+        let report = storage.sweep(&|_: &str| false, 500, budget);
         assert_eq!(report.deleted, 1);
         assert!(!storage.data_path("old.nar").exists());
         assert!(storage.data_path("fresh.nar").exists());
@@ -641,9 +659,50 @@ mod tests {
         a.append(&[0u8; 10]).unwrap();
         a.finish(false);
 
-        let active = HashSet::from(["busy.nar".to_string()]);
-        let report = storage.sweep(&active, 0, 0);
+        // Activeness is re-checked at deletion time, so a name that becomes active after
+        // collection must still be spared.
+        let report = storage.sweep(&|name: &str| name == "busy.nar", 0, 0);
         assert_eq!(report.deleted, 0);
         assert!(storage.data_path("busy.nar").exists());
+    }
+
+    #[test]
+    fn resume_append_rejects_missing_or_short_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = NarCacheStorage::open(dir.path(), u64::MAX).unwrap();
+
+        // No data file at all: fabricating zero bytes up to the watermark is forbidden.
+        let err = storage.resume_append("x.nar", 100, 40).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+
+        // Data file shorter than the watermark: same refusal, existing bytes untouched.
+        let mut a = appender(&storage, "short.nar", 100);
+        a.append(&[1u8; 10]).unwrap();
+        a.finish(false);
+        let err = storage.resume_append("short.nar", 100, 40).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(
+            std::fs::metadata(storage.data_path("short.nar"))
+                .unwrap()
+                .len(),
+            10
+        );
+    }
+
+    #[test]
+    fn append_caps_at_expected_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = NarCacheStorage::open(dir.path(), u64::MAX).unwrap();
+
+        let mut a = appender(&storage, "x.nar", 100);
+        // A lying upstream sends 150 bytes for a 100-byte object: persist only 100.
+        a.append(&[7u8; 150]).unwrap();
+        assert_eq!(a.watermark(), 100);
+        a.finish(true);
+        assert_eq!(
+            std::fs::metadata(storage.data_path("x.nar")).unwrap().len(),
+            100
+        );
+        assert_eq!(storage.inspect("x.nar", 100), PartialState::Complete);
     }
 }
